@@ -13,6 +13,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::{mem, panic, path};
 
 use anyhow::{Result, anyhow};
+use slotmap::{KeyData, SlotMap, new_key_type};
 use wasmtime::{Caller, Engine, FuncType, Linker, Memory, MemoryAccessError, Val, ValType};
 use wasmtime_wasi::p1::WasiP1Ctx;
 
@@ -24,6 +25,7 @@ use self::interop::params::{FfiParam, Param};
 use self::util::{ToCStr, TrackedHashMap, free_cstr};
 
 pub type ParamKey = u32;
+pub const INVALID_PARAM_KEY: ParamKey = 0;
 
 type AbortFn = extern "C" fn(*const c_char, *const c_char);
 type LogFn = extern "C" fn(*const c_char);
@@ -82,6 +84,11 @@ impl Default for CsFns {
 
 type WasmFunctionMetadata = (String, *const c_void, Vec<ParamType>, Vec<ParamType>);
 
+new_key_type! {
+    pub struct ParamsKey;
+    pub struct OpaquePointerKey;
+}
+
 #[derive(Default)]
 pub struct TuringState {
     /// The WASM engine
@@ -89,14 +96,14 @@ pub struct TuringState {
     /// collection of functions to link to wasm. Only used during the initialization phase
     pub wasm_fns: HashMap<String, WasmFunctionMetadata>,
     /// id-tracking map of param objects for ffi.
-    pub param_builders: TrackedHashMap<Params>,
-    pub active_builder: u32,
+    pub param_builders: SlotMap<ParamsKey, Params>,
+    pub active_builder: Option<ParamsKey>,
     /// active WASM function definition for use in the initialization phase
     pub active_wasm_fn: Option<String>,
     /// maps opaque pointer ids to real pointers
-    pub opaque_pointers: TrackedHashMap<*const c_void>,
+    pub opaque_pointers: SlotMap<OpaquePointerKey, *const c_void>,
     /// maps real pointers back to their opaque pointer ids
-    pub pointer_backlink: HashMap<*const c_void, u32>,
+    pub pointer_backlink: HashMap<*const c_void, OpaquePointerKey>,
     /// queue of strings for wasm to fetch (needed due to reentrancy limitations)
     pub str_cache: VecDeque<String>,
 }
@@ -122,16 +129,21 @@ where
 }
 
 /// gets a string out of wasm memory into rust memory.
-fn get_string(message: u32, data: &[u8]) -> String {
-    let mut output_string = String::new();
-    for i in message..u32::MAX {
-        let byte: &u8 = data.get(i as usize).unwrap();
-        if *byte == 0u8 {
-            break;
-        }
-        output_string.push(char::from(*byte));
-    }
-    output_string
+fn get_string(start: u32, data: &[u8]) -> String {
+    CStr::from_bytes_until_nul(data[start as usize..].as_ref())
+        .unwrap()
+        .to_string_lossy()
+        .to_string()
+
+    // let mut output_string = String::new();
+    // for i in message..u32::MAX {
+    //     let byte: &u8 = data.get(i as usize).unwrap();
+    //     if *byte == 0u8 {
+    //         break;
+    //     }
+    //     output_string.push(char::from(*byte));
+    // }
+    // output_string
 }
 
 /// writes a string from rust memory to wasm memory.
@@ -151,17 +163,21 @@ impl TuringState {
         Self {
             wasm: None,
             wasm_fns: HashMap::new(),
-            param_builders: TrackedHashMap::starting_at(1),
-            active_builder: 0,
+            param_builders: Default::default(),
+            active_builder: Default::default(),
             active_wasm_fn: None,
-            opaque_pointers: TrackedHashMap::starting_at(1),
+            opaque_pointers: Default::default(),
             pointer_backlink: HashMap::new(),
             str_cache: VecDeque::new(),
         }
     }
 
     pub fn push_param(&mut self, param: Param) -> Result<()> {
-        match self.param_builders.get_mut(&self.active_builder) {
+        let Some(active_builder) = self.active_builder else {
+            return Err(anyhow!("no param object is currently bound"));
+        };
+
+        match self.param_builders.get_mut(active_builder) {
             Some(builder) => {
                 builder.push(param);
                 Ok(())
@@ -171,7 +187,11 @@ impl TuringState {
     }
 
     pub fn set_param(&mut self, index: u32, value: Param) -> Result<()> {
-        let Some(builder) = self.param_builders.get_mut(&self.active_builder) else {
+        let Some(active_builder) = self.active_builder else {
+            return Err(anyhow!("no param object is currently bound"));
+        };
+
+        let Some(builder) = self.param_builders.get_mut(active_builder) else {
             return Err(anyhow!("param object does not exist"));
         };
         if builder.len() > index {
@@ -186,7 +206,11 @@ impl TuringState {
     }
 
     pub fn read_param(&self, index: u32) -> Param {
-        if let Some(builder) = self.param_builders.get(&self.active_builder) {
+        let Some(active_builder) = self.active_builder else {
+            return Param::Error("no param object is currently bound".to_string());
+        };
+
+        if let Some(builder) = self.param_builders.get(active_builder) {
             if index >= builder.len() {
                 Param::Error("Index out of bounds".to_string())
             } else if let Some(val) = builder.get(index as usize) {
@@ -199,10 +223,11 @@ impl TuringState {
         }
     }
 
-    pub fn swap_params(&mut self, params: ParamKey) -> Result<Params> {
+    pub fn swap_params(&mut self, params: ParamsKey) -> Result<Params> {
         let p = Params::new();
-        if let Some(p) = self.param_builders.swap(&params, p) {
-            Ok(p)
+        if let Some(slot) = self.param_builders.get_mut(params) {
+            let old = mem::replace(slot, p);
+            Ok(old)
         } else {
             Err(anyhow!("Params object does not exist"))
         }
@@ -333,11 +358,11 @@ impl TuringState {
                                 let s = get_string(ptr, memory.data(&caller));
                                 params.push(Param::String(s));
                             },
-                            (ParamType::OBJECT, Val::I32(p)) => {
-                                let p = *p as u32;
+                            (ParamType::OBJECT, Val::I32(pointer_id)) => {
+                                let pointer_key = OpaquePointerKey::from(KeyData::from_ffi(*pointer_id as u64));
                                 if let Some(state) = &mut STATE {
                                     let s = state.borrow_mut();
-                                    if let Some(true_pointer) = s.opaque_pointers.get(&p) {
+                                    if let Some(true_pointer) = s.opaque_pointers.get(pointer_key) {
                                         params.push(Param::Object(*true_pointer));
                                     } else {
                                         return Err(anyhow!("opaque pointer does not correspond to a real pointer")).into_wasm();
@@ -352,13 +377,14 @@ impl TuringState {
                     let pid = if let Some(state) = &mut STATE {
                         let mut s = state.borrow_mut();
 
-                        s.param_builders.add(params)
+                        s.param_builders.insert(params)
                     } else {
                         unreachable!("This cannot happen (probably)")
                     };
 
                     // Call to C#/rust's provided callback
-                    let res = func(pid).to_param().into_wasm()?;
+                    //TODO: Can we ensure u64 -> u32 is safe here?
+                    let res = func(pid.0.as_ffi() as u32).to_param().into_wasm()?;
 
                     // coerce C# return value into wasm
                     if let Some(state) = &mut STATE {
@@ -378,14 +404,15 @@ impl TuringState {
                                 Val::I32(l as i32)
                             },
                             Param::Object(p) => {
-                                let opaque = if let Some(opaque) = s.pointer_backlink.get(&p) {
-                                    *opaque
-                                } else {
-                                    let op = s.opaque_pointers.add(p);
-                                    s.pointer_backlink.insert(p, op);
-                                    op
+                                let opaque = match s.pointer_backlink.get(&p) {
+                                    Some(opaque) => *opaque,
+                                    None => {
+                                        let op = s.opaque_pointers.insert(p);
+                                        s.pointer_backlink.insert(p, op);
+                                        op
+                                    }
                                 };
-                                Val::I32(opaque as i32)
+                                Val::I32(opaque.0.as_ffi() as i32)
                             },
                             Param::Error(er) => {
                                 return Err(anyhow!("Error executing C# function: {}", er)).into_wasm()
@@ -574,9 +601,9 @@ pub extern "C" fn create_params() -> ParamKey {
         };
 
         let mut s = state.borrow_mut();
-        let x = s.param_builders.add(Params::new());
-        s.active_builder = x;
-        x
+        let x = s.param_builders.insert(Params::new());
+        s.active_builder = Some(x);
+        x.0.as_ffi() as ParamKey
     }
 }
 
@@ -588,9 +615,9 @@ pub extern "C" fn create_n_params(size: u32) -> ParamKey {
             return 0;
         };
         let mut s = state.borrow_mut();
-        let x = s.param_builders.add(Params::of_size(size));
-        s.active_builder = x;
-        x
+        let x = s.param_builders.insert(Params::of_size(size));
+        s.active_builder = Some(x);
+        x.0.as_ffi() as ParamKey
     }
 }
 
@@ -600,7 +627,7 @@ pub extern "C" fn bind_params(params: ParamKey) {
     unsafe {
         if let Some(state) = &mut STATE {
             let mut s = state.borrow_mut();
-            s.active_builder = params;
+            s.active_builder = Some(ParamsKey::from(KeyData::from_ffi(params as u64)));
         }
     }
 }
@@ -670,11 +697,12 @@ pub extern "C" fn read_param(index: u32) -> FfiParam {
 /// frees the params object tied to an id if present, otherwise does nothing.
 pub extern "C" fn delete_params(params: ParamKey) {
     unsafe {
+        let param_key = ParamsKey::from(KeyData::from_ffi(params as u64));
         if let Some(state) = &mut STATE {
             let mut s = state.borrow_mut();
-            s.param_builders.remove(&params);
-            if s.active_builder == params {
-                s.active_builder = 0;
+            s.param_builders.remove(param_key);
+            if s.active_builder == Some(param_key) {
+                s.active_builder = None;
             }
         }
     }
@@ -698,9 +726,10 @@ pub unsafe extern "C" fn call_wasm_fn(
             return Param::Error(TURING_UNINIT.to_string()).into();
         };
         let mut s = state.borrow_mut();
-        let params2 = if params == 0 {
+        // TODO: Use u32::MAX as a sentinel value instead of 0?
+        let params2 = if params == INVALID_PARAM_KEY {
             Params::new()
-        } else if let Ok(p) = s.swap_params(params) {
+        } else if let Ok(p) = s.swap_params(ParamsKey::from(KeyData::from_ffi(params as u64))) {
             p
         } else {
             return Param::Error("Params object does not exist".to_string()).into();
