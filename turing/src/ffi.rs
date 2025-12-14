@@ -388,11 +388,12 @@ pub unsafe extern "C" fn call_wasm_fn(
         drop(s); // release borrow before calling wasm
 
         let name = CStr::from_ptr(name).to_string_lossy().to_string();
+        let state_ref = Arc::clone(&state.borrow().shared_state);
         let res = wasm.call_fn(
             &name,
             params2,
             expected_return_type,
-            &state.borrow().shared_state,
+            &state_ref,
         );
 
         state.borrow_mut().wasm = Some(wasm);
