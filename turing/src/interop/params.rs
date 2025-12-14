@@ -10,7 +10,7 @@ use wasmtime_wasi::p1::WasiP1Ctx;
 
 use crate::ffi::Ext;
 use crate::interop::types::ExtString;
-use crate::{OpaquePointerKey, ParamKey, ParamsKey, TuringDataState, TuringState, get_string};
+use crate::{OpaquePointerKey, ParamKey, ParamsKey, TuringSharedState, TuringState, get_string};
 
 /// These ids must remain consistent on both sides of ffi.
 #[repr(u32)]
@@ -121,10 +121,37 @@ pub struct FfiParam {
     pub value: RawParam,
 }
 
+/// C repr of an array of FfiParams
 #[repr(C)]
+#[derive(Clone)]
 pub struct FfiParamArray {
     pub count: u32,
-    pub ptr: *const c_void,
+    pub ptr: *const FfiParam,
+}
+
+impl FfiParamArray {
+    /// Creates an empty FfiParamArray.
+    pub fn empty() -> Self {
+        FfiParamArray {
+            count: 0,
+            ptr: std::ptr::null(),
+        }
+    }
+
+    pub fn to_params(self) -> Result<Params> {
+        Ok(Params {
+            params: Vec::try_from(self)?,
+        })
+    }
+    
+    pub fn as_slice(&self) -> &[FfiParam] {
+        unsafe { std::slice::from_raw_parts(self.ptr, self.count as usize) }
+    }
+
+    pub(crate) fn get_param(&self, arg: usize) -> &FfiParam {
+        assert!(arg < self.count as usize);
+        &self.as_slice()[arg]
+    }
 }
 
 impl Param {
@@ -163,7 +190,7 @@ impl Param {
     pub fn from_typval(
         typ: ParamType,
         val: Val,
-        context: &TuringDataState,
+        context: &TuringSharedState,
         memory: &Memory,
         caller: &Store<WasiP1Ctx>,
     ) -> Self {
@@ -194,8 +221,8 @@ impl Param {
                     .opaque_pointers
                     .get(key)
                     .copied()
-                    .unwrap_or(std::ptr::null::<c_void>());
-                Param::Object(real)
+                    .unwrap_or_default();
+                Param::Object(real.ptr)
             }
             ParamType::ExtError => {
                 let ptr = val.unwrap_i32() as u32;
@@ -209,6 +236,44 @@ impl Param {
 }
 
 impl FfiParam {
+    /// Clones the FfiParam into a Param without taking ownership of any allocations.
+    pub fn to_param_clone(&self) -> Result<Param> {
+        Ok(match self.type_id {
+            ParamType::I8 => Param::I8(unsafe { self.value.i8 }),
+            ParamType::I16 => Param::I16(unsafe { self.value.i16 }),
+            ParamType::I32 => Param::I32(unsafe { self.value.i32 }),
+            ParamType::I64 => Param::I64(unsafe { self.value.i64 }),
+            ParamType::U8 => Param::U8(unsafe { self.value.u8 }),
+            ParamType::U16 => Param::U16(unsafe { self.value.u16 }),
+            ParamType::U32 => Param::U32(unsafe { self.value.u32 }),
+            ParamType::U64 => Param::U64(unsafe { self.value.u64 }),
+            ParamType::F32 => Param::F32(unsafe { self.value.f32 }),
+            ParamType::F64 => Param::F64(unsafe { self.value.f64 }),
+            ParamType::BOOL => Param::Bool(unsafe { self.value.bool }),
+            ParamType::RustString => Param::String(unsafe {
+                CStr::from_ptr(self.value.string)
+                    .to_str()
+                    .expect("Rust invalid string")
+                    .to_string()
+            }),
+            ParamType::ExtString => {
+                Param::String(unsafe { ExtString::from(self.value.string).to_string() })
+            }
+            ParamType::OBJECT => Param::Object(unsafe { self.value.object }),
+            ParamType::RustError => Param::Error(unsafe {
+                CStr::from_ptr(self.value.error)
+                    .to_str()
+                    .expect("Rust invalid string")
+                    .to_string()
+            }),
+            ParamType::ExtError => {
+                Param::Error(unsafe { ExtString::from(self.value.error).to_string() })
+            }
+            ParamType::VOID => Param::Void,
+        })
+    }
+
+    /// Converts the FfiParam into a Param, taking ownership of any allocations.
     pub fn to_param(self) -> Result<Param> {
         Ok(match self.type_id {
             ParamType::I8 => Param::I8(unsafe { self.value.i8 }),
@@ -292,7 +357,7 @@ impl Params {
     }
 
     /// Converts the Params into a vector of Wasmtime Val types for function calling.
-    pub fn to_args(self, state: &mut TuringDataState) -> Vec<Val> {
+    pub fn to_args(self, state: &mut TuringSharedState) -> Vec<Val> {
         let mut vals = Vec::new();
 
         for p in self.params {
@@ -313,11 +378,11 @@ impl Params {
                     state.str_cache.push_back(st);
                     Val::I32(l as i32)
                 }
-                Param::Object(rp) => match state.pointer_backlink.get(&rp) {
+                Param::Object(rp) => match state.pointer_backlink.get(&rp.into()) {
                     Some(op) => Val::I32(op.0.as_ffi() as i32),
                     None => {
-                        let op = state.opaque_pointers.insert(rp);
-                        state.pointer_backlink.insert(rp, op);
+                        let op = state.opaque_pointers.insert(rp.into());
+                        state.pointer_backlink.insert(rp.into(), op);
                         Val::I32(op.0.as_ffi() as i32)
                     }
                 },
@@ -331,6 +396,10 @@ impl Params {
         }
 
         vals
+    }
+
+    pub fn to_ffi(self) -> FfiParamArray {
+        FfiParamArray::from(self.params)
     }
 }
 
@@ -348,7 +417,7 @@ impl From<Vec<Param>> for FfiParamArray {
         let ffi_params = ffi_params.into_boxed_slice();
 
         let count = ffi_params.len() as u32;
-        let ptr = ffi_params.as_ptr() as *const c_void;
+        let ptr = ffi_params.as_ptr();
 
         // cleaned up by the caller via TryFrom<FfiParamArray> for Vec<Param>
         mem::forget(ffi_params);

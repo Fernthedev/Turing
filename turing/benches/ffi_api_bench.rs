@@ -12,27 +12,21 @@ use turing::ffi::{
     create_wasm_fn, delete_params, init_turing, init_wasm, load_script, read_param,
     set_wasm_fn_return_type, uninit_turing,
 };
-use turing::interop::params::{FfiParam, Param, ParamType, RawParam};
+use turing::interop::params::{FfiParam, FfiParamArray, Param, ParamType, RawParam};
 
-use turing::ParamKey;
-
-extern "C" fn bench_log_info(params: ParamKey) -> FfiParam {
+extern "C" fn bench_log_info(params: FfiParamArray) -> FfiParam {
     // simple host logger for wasm; read first param if present
-    unsafe {
-        bind_params(params);
-        let p = read_param(0).to_param();
-        match p {
-            Ok(Param::String(s)) => {
-                // drop or log; keep lightweight
-                let _ = s;
-            }
-            _ => {}
-        }
+
+    let p = params.as_slice().first().unwrap().to_param_clone();
+    if let Ok(Param::String(s)) = p {
+        // drop or log; keep lightweight
+        let _ = s;
     }
+
     Param::Void.into()
 }
 
-extern "C" fn bench_fetch_string(_params: ParamKey) -> FfiParam {
+extern "C" fn bench_fetch_string(params: FfiParamArray) -> FfiParam {
     Param::String("host provided string".to_string()).into()
 }
 
@@ -141,13 +135,9 @@ fn bench_call_tests_wasm_math(c: &mut Criterion) {
     let name_log = CString::new("log_info").unwrap();
     let name_fetch = CString::new("fetch_string").unwrap();
     unsafe {
-        let _ = create_wasm_fn(cap_ptr, name_log.as_ptr(), bench_log_info as *const c_void);
+        let _ = create_wasm_fn(cap_ptr, name_log.as_ptr(), bench_log_info);
         let _ = add_wasm_fn_param_type(ParamType::RustString);
-        let _ = create_wasm_fn(
-            cap_ptr,
-            name_fetch.as_ptr(),
-            bench_fetch_string as *const c_void,
-        );
+        let _ = create_wasm_fn(cap_ptr, name_fetch.as_ptr(), bench_fetch_string);
         let _ = set_wasm_fn_return_type(ParamType::RustString);
         let _ = init_wasm();
 

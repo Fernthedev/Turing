@@ -13,7 +13,7 @@ use wasmtime_wasi::p1::WasiP1Ctx;
 
 use crate::ffi::Log;
 use crate::interop::params::{Param, ParamType, Params};
-use crate::TuringState;
+use crate::{TuringSharedState, TuringState};
 
 pub struct WasmInterpreter {
     engine: Engine,
@@ -154,7 +154,7 @@ impl WasmInterpreter {
         params: Params,
         ret_type: ParamType,
         // use a refcell to avoid borrow issues
-        state: &RefCell<TuringState>,
+        state: &RwLock<TuringSharedState>,
     ) -> Param {
         let Some(instance) = &mut self.script_instance else {
             return Param::Error("No script is loaded or reentry was attempted".to_string());
@@ -167,17 +167,17 @@ impl WasmInterpreter {
             .get_export(&mut self.store, "memory")
             .and_then(|m| m.into_memory())
             .unwrap();
-        let args = params.to_args(&mut state.borrow_mut().turing_mini_ctx);
+        let args = params.to_args(&mut state.write().unwrap());
 
         let mut res = match ret_type {
             ParamType::VOID => Vec::new(),
             ParamType::F32 => vec![Val::F32(0)],
             ParamType::F64 => vec![Val::F64(0)],
-            ParamType::I64
-            | ParamType::U64 => vec![Val::I64(0)],
+            ParamType::I64 | ParamType::U64 => vec![Val::I64(0)],
             _ => vec![Val::I32(0)],
         };
 
+        // we can't be borrowing here
         if let Err(e) = f.call(&mut self.store, &args, &mut res) {
             return Param::Error(e.to_string());
         }
@@ -188,6 +188,12 @@ impl WasmInterpreter {
         let rt = res[0];
 
         // convert Val to Param
-        Param::from_typval(ret_type, rt, &state.borrow().turing_mini_ctx, &memory, &self.store)
+        Param::from_typval(
+            ret_type,
+            rt,
+            &state.read().unwrap(),
+            &memory,
+            &self.store,
+        )
     }
 }

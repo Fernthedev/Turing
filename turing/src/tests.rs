@@ -1,5 +1,5 @@
 use crate::ffi::*;
-use crate::interop::params::{FfiParam, Param};
+use crate::interop::params::{FfiParam, FfiParamArray, Param};
 use crate::*;
 use anyhow::{Result, anyhow};
 use serial_test::serial;
@@ -14,8 +14,8 @@ extern "C" fn log_info_stand_in(msg: *const c_char) {
     }
 }
 
-extern "C" fn log_info_wasm(params: ParamKey) -> FfiParam {
-    bind_params(params);
+extern "C" fn log_info_wasm(params: FfiParamArray) -> FfiParam {
+    let s = params.get_param(0);
     let s = read_param(0).to_param();
     match s {
         Ok(Param::String(s)) => {
@@ -35,7 +35,7 @@ extern "C" fn log_info_wasm(params: ParamKey) -> FfiParam {
     Param::Void.into()
 }
 
-extern "C" fn fetch_string(_params: ParamKey) -> FfiParam {
+extern "C" fn fetch_string(params: FfiParamArray) -> FfiParam {
     Param::String("this is a host provided string!".to_string()).into()
 }
 
@@ -53,7 +53,7 @@ pub fn setup_wasm() -> Result<()> {
         let cap = CString::new("test")?;
 
         let cap_ptr = cap.as_ptr();
-        let res = create_wasm_fn(cap_ptr, cstr.as_ptr(), log_info_wasm as *const c_void).to_param()?;
+        let res = create_wasm_fn(cap_ptr, cstr.as_ptr(), log_info_wasm).to_param()?;
         if let Param::Error(e) = res {
             return Err(anyhow!("Creation of wasm function failed: {}", e));
         }
@@ -63,7 +63,7 @@ pub fn setup_wasm() -> Result<()> {
         }
 
         let cstr = CString::new("fetch_string")?;
-        let pointer = fetch_string as *const c_void;
+        let pointer = fetch_string;
         let res = create_wasm_fn(cap_ptr, cstr.as_ptr(), pointer).to_param()?;
         if let Param::Error(e) = res {
             return Err(anyhow!("Creation of wasm function failed: {}", e));

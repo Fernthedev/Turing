@@ -3,6 +3,8 @@
 use anyhow::anyhow;
 use slotmap::KeyData;
 use std::collections::HashSet;
+use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 use std::{
     cell::RefCell,
     ffi::{CStr, CString, c_char, c_void},
@@ -11,6 +13,9 @@ use std::{
 use wasmtime::{Caller, Val};
 use wasmtime_wasi::p1::WasiP1Ctx;
 
+use crate::interop::types::ExtPointer;
+use crate::{TuringSharedState, WasmFunctionMetadata};
+use crate::interop::params::FfiParamArray;
 use crate::{
     ExtFns, IntoWasm, OpaquePointerKey, PARAM_KEY_INVALID, ParamKey, ParamsKey, ToCStr,
     TuringState, get_string,
@@ -25,7 +30,7 @@ static mut EXT_FNS: Option<RefCell<ExtFns>> = None;
 
 const TURING_UNINIT: &str = "Turing has not been initialized";
 
-pub type FfiCallback = extern "C" fn(ParamKey) -> FfiParam;
+pub type FfiCallback = extern "C" fn(FfiParamArray) -> FfiParam;
 
 /// turing.rs internal Log system, not used by wasm.
 pub struct Log {}
@@ -96,7 +101,7 @@ pub extern "C" fn uninit_turing() {
 pub unsafe extern "C" fn create_wasm_fn(
     capability: *const c_char,
     name: *const c_char,
-    pointer: *const c_void,
+    pointer: FfiCallback,
 ) -> FfiParam {
     unsafe {
         let name = CStr::from_ptr(name).to_string_lossy().to_string();
@@ -112,8 +117,15 @@ pub unsafe extern "C" fn create_wasm_fn(
             return Param::Error(format!("wasm fn is already defined: '{}'", name)).into();
         }
         s.active_wasm_fn = Some(name.clone());
-        s.wasm_fns
-            .insert(name, (capability, pointer, Vec::new(), Vec::new()));
+        s.wasm_fns.insert(
+            name,
+            WasmFunctionMetadata {
+                capability,
+                addr: pointer.into(),
+                params: Default::default(),
+                ret: Default::default(),
+            },
+        );
         Param::Void.into()
     }
 }
@@ -156,7 +168,7 @@ pub extern "C" fn add_wasm_fn_param_type(param_type: ParamType) -> FfiParam {
         }
         let active = s.active_wasm_fn.as_ref().unwrap().clone();
         let fn_builder = s.wasm_fns.get_mut(&active).unwrap();
-        fn_builder.2.push(param_type);
+        fn_builder.params.push(param_type);
         Param::Void.into()
     }
 }
@@ -199,7 +211,7 @@ pub extern "C" fn set_wasm_fn_return_type(return_type: ParamType) -> FfiParam {
 
         let active = s.active_wasm_fn.as_ref().unwrap().clone();
         let fn_builder = s.wasm_fns.get_mut(&active).unwrap();
-        fn_builder.3.push(return_type);
+        fn_builder.ret.push(return_type);
         Param::Void.into()
     }
 }
@@ -376,7 +388,12 @@ pub unsafe extern "C" fn call_wasm_fn(
         drop(s); // release borrow before calling wasm
 
         let name = CStr::from_ptr(name).to_string_lossy().to_string();
-        let res = wasm.call_fn(&name, params2, expected_return_type, state);
+        let res = wasm.call_fn(
+            &name,
+            params2,
+            expected_return_type,
+            &state.borrow().shared_state,
+        );
 
         state.borrow_mut().wasm = Some(wasm);
 
@@ -436,7 +453,6 @@ pub unsafe extern "C" fn load_script(
                 return Param::Error(format!("Failed to instantiate wasm module: {}", e)).into();
             };
         }
-        s.turing_mini_ctx.active_capabilities.clear();
         let mut caps = HashSet::new();
         {
             let Some(list) = s.param_builders.get(ParamsKey::from(KeyData::from_ffi(
@@ -463,7 +479,7 @@ pub unsafe extern "C" fn load_script(
                 caps.insert(s.clone());
             }
         }
-        mem::swap(&mut caps, &mut s.turing_mini_ctx.active_capabilities);
+        s.shared_state.write().unwrap().active_capabilities = caps;
 
         Param::Void.into()
     }
@@ -497,16 +513,12 @@ pub fn wasm_host_strcpy(
     mut caller: Caller<'_, WasiP1Ctx>,
     ps: &[Val],
     rs: &mut [Val],
+    state: &mut TuringSharedState,
 ) -> Result<(), anyhow::Error> {
     let ptr = ps[0].i32().unwrap();
     let size = ps[1].i32().unwrap();
-    unsafe {
-        let Some(state) = &mut STATE else {
-            rs[0] = Val::I32(0);
-            return Ok(());
-        };
-
-        if let Some(st) = state.borrow_mut().turing_mini_ctx.str_cache.pop_front()
+     {
+        if let Some(st) = state.str_cache.pop_front()
             && st.len() + 1 == size as usize
         {
             if let Some(memory) = caller.get_export("memory").and_then(|m| m.into_memory()) {
@@ -525,18 +537,20 @@ pub fn wasm_bind_env(
     ps: &[Val],
     rs: &mut [Val],
     p: Vec<ParamType>,
-    func: extern "C" fn(ParamKey) -> FfiParam,
+    func: extern "C" fn(FfiParamArray) -> FfiParam,
+    state: &RwLock<TuringSharedState>,
 ) -> Result<(), anyhow::Error> {
     let mut params = Params::new();
 
-    if let Some(state) = unsafe { &mut STATE } {
-        let s = state.borrow_mut();
-        if !s.turing_mini_ctx.active_capabilities.contains(cap) {
+    {
+        let s = state.read().unwrap();
+        if !s.active_capabilities.contains(cap) {
             return Err(anyhow!("Mod capability '{}' is not loaded", cap));
         }
     }
 
     // set up function parameters
+    // into FfiParam
     for (exp_typ, value) in p.iter().zip(ps) {
         match (exp_typ, value) {
             (ParamType::I8, Val::I32(i)) => params.push(Param::I8(*i as i8)),
@@ -563,72 +577,66 @@ pub fn wasm_bind_env(
                 let pointer_key =
                     OpaquePointerKey::from(KeyData::from_ffi(*pointer_id as ParamKey));
 
-                if let Some(state) = unsafe { &mut STATE } {
-                    let s = state.borrow_mut();
-                    if let Some(true_pointer) = s.turing_mini_ctx.opaque_pointers.get(pointer_key) {
-                        params.push(Param::Object(*true_pointer));
-                    } else {
-                        return Err(anyhow!(
-                            "opaque pointer does not correspond to a real pointer"
-                        ))
-                        .into_wasm();
-                    }
+                let s = state.read().unwrap();
+                if let Some(true_pointer) = s.opaque_pointers.get(pointer_key) {
+                    params.push(Param::Object(**true_pointer));
+                } else {
+                    return Err(anyhow!(
+                        "opaque pointer does not correspond to a real pointer"
+                    ))
+                    .into_wasm();
                 }
             }
             _ => params.push(Param::Error("Mismatched parameter type".to_string())),
         }
     }
 
-    // push parameters into an FfiParams
-    let pid = if let Some(state) = unsafe { &mut STATE } {
-        let mut s = state.borrow_mut();
+    let ffi_params = params.to_ffi();
 
-        s.param_builders.insert(params)
-    } else {
-        unreachable!("This cannot happen (probably)")
-    };
+    // Call to C#/rust's provided callback using a clone so we can still cleanup
+    let res = func(ffi_params.clone()).to_param().into_wasm()?;
 
-    // Call to C#/rust's provided callback
-    let res = func(pid.0.as_ffi() as ParamKey).to_param().into_wasm()?;
+    // cleanup ffi_params
+    let _ = ffi_params.to_params();
 
     // coerce C# return value into wasm
-    if let Some(state) = unsafe { &mut STATE } {
-        let mut s = state.borrow_mut();
-        let rv = match res {
-            Param::I8(i) => Val::I32(i as i32),
-            Param::I16(i) => Val::I32(i as i32),
-            Param::I32(i) => Val::I32(i),
-            Param::I64(i) => Val::I64(i),
-            Param::U8(u) => Val::I32(u as i32),
-            Param::U16(u) => Val::I32(u as i32),
-            Param::U32(u) => Val::I32(u as i32),
-            Param::U64(u) => Val::I64(u as i64),
-            Param::F32(f) => Val::F32(f.to_bits()),
-            Param::F64(f) => Val::F64(f.to_bits()),
-            Param::Bool(b) => Val::I32(if b { 1 } else { 0 }),
-            Param::String(st) => {
-                let l = st.len() + 1;
-                s.turing_mini_ctx.str_cache.push_back(st);
-                Val::I32(l as i32)
-            }
-            Param::Object(p) => {
-                let opaque = if let Some(opaque) = s.turing_mini_ctx.pointer_backlink.get(&p) {
-                    *opaque
-                } else {
-                    let op = s.turing_mini_ctx.opaque_pointers.insert(p);
-                    s.turing_mini_ctx.pointer_backlink.insert(p, op);
-                    op
-                };
-                Val::I32(opaque.0.as_ffi() as i32)
-            }
-            Param::Error(er) => {
-                return Err(anyhow!("Error executing C# function: {}", er)).into_wasm();
-            }
-            Param::Void => return Ok(()),
-        };
 
-        rs[0] = rv;
-    }
+    let mut s = state.write().unwrap();
+    let rv = match res {
+        Param::I8(i) => Val::I32(i as i32),
+        Param::I16(i) => Val::I32(i as i32),
+        Param::I32(i) => Val::I32(i),
+        Param::I64(i) => Val::I64(i),
+        Param::U8(u) => Val::I32(u as i32),
+        Param::U16(u) => Val::I32(u as i32),
+        Param::U32(u) => Val::I32(u as i32),
+        Param::U64(u) => Val::I64(u as i64),
+        Param::F32(f) => Val::F32(f.to_bits()),
+        Param::F64(f) => Val::F64(f.to_bits()),
+        Param::Bool(b) => Val::I32(if b { 1 } else { 0 }),
+        Param::String(st) => {
+            let l = st.len() + 1;
+            s.str_cache.push_back(st);
+            Val::I32(l as i32)
+        }
+        Param::Object(pointer) => {
+            let pointer = ExtPointer::from(pointer );
+            let opaque = if let Some(opaque) = s.pointer_backlink.get(&pointer) {
+                *opaque
+            } else {
+                let op = s.opaque_pointers.insert(pointer);
+                s.pointer_backlink.insert(pointer, op);
+                op
+            };
+            Val::I32(opaque.0.as_ffi() as i32)
+        }
+        Param::Error(er) => {
+            return Err(anyhow!("Error executing C# function: {}", er)).into_wasm();
+        }
+        Param::Void => return Ok(()),
+    };
+
+    rs[0] = rv;
 
     Ok(())
 }

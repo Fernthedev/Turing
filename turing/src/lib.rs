@@ -9,9 +9,13 @@ pub mod ffi;
 #[cfg(test)]
 pub mod tests;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
+use std::ops::Deref;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use slotmap::{SlotMap, new_key_type};
@@ -19,6 +23,7 @@ use wasmtime::{Caller, Engine, FuncType, Linker, Memory, MemoryAccessError, Val,
 use wasmtime_wasi::p1::WasiP1Ctx;
 
 use crate::ffi::{FfiCallback, wasm_bind_env, wasm_host_strcpy};
+use crate::interop::types::ExtPointer;
 use crate::wasm::wasm_engine::WasmInterpreter;
 
 use crate::interop::params::{ParamType, Params};
@@ -81,7 +86,12 @@ impl Default for ExtFns {
     }
 }
 
-type WasmFunctionMetadata = (String, *const c_void, Vec<ParamType>, Vec<ParamType>);
+pub struct WasmFunctionMetadata {
+    capability: String,
+    addr: FfiCallback,
+    params: Vec<ParamType>,
+    ret: Vec<ParamType>,
+}
 
 #[derive(Default)]
 pub struct TuringState {
@@ -96,15 +106,16 @@ pub struct TuringState {
     pub active_wasm_fn: Option<String>,
 
     /// Stores state that is passed around
-    pub turing_mini_ctx: TuringDataState,
+    pub shared_state: Arc<std::sync::RwLock<TuringSharedState>>,
 }
 
+
 #[derive(Default)]
-pub struct TuringDataState {
+pub struct TuringSharedState {
     /// maps opaque pointer ids to real pointers
-    pub opaque_pointers: SlotMap<OpaquePointerKey, *const c_void>,
+    pub opaque_pointers: SlotMap<OpaquePointerKey, ExtPointer<c_void>>,
     /// maps real pointers back to their opaque pointer ids
-    pub pointer_backlink: HashMap<*const c_void, OpaquePointerKey>,
+    pub pointer_backlink: HashMap<ExtPointer<c_void>, OpaquePointerKey>,
     /// queue of strings for wasm to fetch (needed due to reentrancy limitations)
     pub str_cache: VecDeque<String>,
     /// which mods are currently active
@@ -169,7 +180,7 @@ impl TuringState {
             param_builders: SlotMap::with_key(),
             active_builder: None,
             active_wasm_fn: None,
-            turing_mini_ctx: TuringDataState::default(),
+            shared_state: Default::default(),
         }
     }
 
@@ -249,29 +260,32 @@ impl TuringState {
             //    failing to retrieve all param strings in the correct order will invalidate
             //    the strings with no way to recover.
 
+            let state_copy = Arc::clone(&self.shared_state);
             linker
                 .func_new(
                     "env",
                     "_host_strcpy",
                     FuncType::new(engine, vec![ValType::I32, ValType::I32], vec![ValType::I32]),
-                    wasm_host_strcpy,
+                    move |caller: Caller<'_, WasiP1Ctx>, ps: &[Val], rs: &mut [Val]| {
+                        wasm_host_strcpy(caller, ps, rs, &mut state_copy.write().unwrap())
+                    },
                 )
                 .unwrap();
 
             // C# wasm bindings
-            let fns;
-            {
-                fns = self.wasm_fns.clone();
-            }
+            let fns = &self.wasm_fns;
 
             // n: wasm name, cap: capability (mod), p: param types, r: return type.
-            for (n, (cap, func_ptr, p, r)) in fns.iter() {
-                let func: FfiCallback = mem::transmute(*func_ptr);
+            for (n, registered_fn) in fns.iter() {
+                let func: FfiCallback = registered_fn.addr;
+                let ret = &registered_fn.ret;
+                let params = registered_fn.params.clone();
+                let cap = registered_fn.capability.clone();
 
                 // unpack ffi type ids into wasm types
                 let mut p_types = Vec::new();
                 let mut r_type = Vec::new();
-                for pt in p {
+                for pt in &params {
                     let p_type = match pt {
                         ParamType::I8
                         | ParamType::I16
@@ -292,8 +306,8 @@ impl TuringState {
                     };
                     p_types.push(p_type);
                 }
-                if !r.is_empty() {
-                    let r_typ = match r[0] {
+                if !ret.is_empty() {
+                    let r_typ = match ret[0] {
                         ParamType::I8
                         | ParamType::I16
                         | ParamType::I32
@@ -316,16 +330,24 @@ impl TuringState {
 
                 // register function to wasm.
                 let ft = FuncType::new(engine, p_types, r_type);
-                let p = p.clone();
 
-                let cap = cap.clone();
+                let state = Arc::clone(&self.shared_state);
                 linker
                     .func_new(
                         "env",
                         n.clone().as_str(),
                         ft,
                         move |caller: Caller<'_, WasiP1Ctx>, ps: &[Val], rs: &mut [Val]| {
-                            wasm_bind_env(caller, &cap, ps, rs, p.clone(), func)
+                            let state = Arc::clone(&state);
+                            wasm_bind_env(
+                                caller,
+                                &cap,
+                                ps,
+                                rs,
+                                params.clone(),
+                                func,
+                                &state,
+                            )
                         },
                     )
                     .unwrap();
